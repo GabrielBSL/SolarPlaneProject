@@ -6,18 +6,10 @@
 #include <tuple>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
 #include <ctime>
-
-const int X_RAYAMOUNT = 3;
-const int Y_RAYAMOUNT = 3;
-
-const int PLANEAMOUNT = 1;
-const int THREADSPERBLOCK = 64;
-
-__constant__ int MAXRAYREFLECTION = 10;
-__constant__ float RAYABSORPTIONRATIO = 0.2;
-__constant__ float RAYREFLECTIONRATIO = 0.1;
+#include <time.h>
+#define _USE_MATH_DEFINES
+#include <math.h>
 
 struct vec3
 {
@@ -45,9 +37,9 @@ struct vec3
         return { x * other_vec3.x, y * other_vec3.y, z * other_vec3.z };
     }
 
-    struct vec3 operator*(float scalar) const 
+    struct vec3 operator*(float scalar) const
     {
-        return { x* scalar, y* scalar, z* scalar};
+        return { x * scalar, y * scalar, z * scalar };
     }
 };
 
@@ -64,30 +56,54 @@ struct plane
     struct vec3 pb;
     struct vec3 pc;
     struct vec3 pd;
-    struct vec3 center;
     struct vec3 normal;
 };
+
+//Ray constants
+const int ARC_DISTANCE = 10;
+const int ARC_POINTS = 5;
+const int ARC_ANGLE = 45;
+const int X_RAY_AMOUNT = 40;
+const int Y_RAY_AMOUNT = 20;
+const float ARC_HEIGHT = 2;
+const float RAY_INTER_DISTANCE = .4f;
+const float RAY_GROUP_ENERGY = 1;
+
+//Solar plane constants
+const int PLANE_AMOUNT = 10;
+const float PLANE_WIDTH = 3;
+const float PLANE_HEIGHT = 2;
+const vec3 PLANE_MIN_BOUNDS = { -4, 0, -4 };
+const vec3 PLANE_MAX_BOUNDS = { 4, 4, 4 };
+
+//Simulation handle constants
+const int MAXGENERATIONLOOP = 1000;
+
+//Device constants
+const int MAX_RAY_REFLECTION = 10;
+const float RAY_ABSORPTION_RATIO = .2f;
+const float RAY_REFLECTION_RATIO = .1f;
 
 #pragma region DeviceFunctions
 
 #pragma region vec3Operations
 
-__device__ struct vec3 vec3Plus(struct vec3 first, struct vec3 second) 
+__device__ struct vec3 d_vec3Plus(struct vec3 first, struct vec3 second)
 {
     return { first.x + second.x, first.y + second.y, first.z + second.z };
 }
 
-__device__ struct vec3 vec3Minus(struct vec3 first, struct vec3 second)
+__device__ struct vec3 d_vec3Minus(struct vec3 first, struct vec3 second)
 {
     return { first.x - second.x, first.y - second.y, first.z - second.z };
 }
 
-__device__ struct vec3 vec3Multi(struct vec3 first, struct vec3 second)
+__device__ struct vec3 d_vec3Multi(struct vec3 first, struct vec3 second)
 {
     return { first.x * second.x, first.y * second.y, first.z * second.z };
 }
 
-__device__ struct vec3 vec3Multi(struct vec3 first, float multiplier)
+__device__ struct vec3 d_vec3Multi(struct vec3 first, float multiplier)
 {
     return { first.x * multiplier, first.y * multiplier, first.z * multiplier };
 }
@@ -115,7 +131,7 @@ __device__ struct vec3 d_planeGet(struct plane plane_toget, int index)
     }
 }
 
-// Função para calcular o produto vetorial entre dois vetores
+// Function to calculate the cross product between two vectors
 __device__ vec3 d_cross(struct vec3 a, struct vec3 b)
 {
     vec3 result;
@@ -127,13 +143,22 @@ __device__ vec3 d_cross(struct vec3 a, struct vec3 b)
     return result;
 }
 
-// Função para calcular o produto escalar (dot product) entre dois vetores
+// Function to calculate the dot product between two vectors
 __device__ float d_dot(struct vec3 a, struct vec3 b)
 {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// Função para normalizar um vetor vec3
+// Function that returns the square distance of two points
+__device__ float d_squaredDistance(struct vec3 a, struct vec3 b)
+{
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    float dz = a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// Function to normalize a vector
 __device__ struct vec3 d_normalize(struct vec3 v) {
     float len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
 
@@ -147,139 +172,146 @@ __device__ struct vec3 d_normalize(struct vec3 v) {
     return v;
 }
 
-// Função para verificar se um ponto está dentro de um triângulo
-__device__ bool isPointInsideTriangle(struct vec3 point, struct vec3 t1, struct vec3 t2, struct vec3 t3) {
-    // Calcular vetores dos vértices do triângulo para o ponto de interseção
-    vec3 v0 = vec3Minus(t2, t1);
-    vec3 v1 = vec3Minus(t3, t1);
-    vec3 v2 = vec3Minus(point, t1);
-
-    // Calcular produtos escalares
-    float dot00 = d_dot(v0, v0);
-    float dot01 = d_dot(v0, v1);
-    float dot02 = d_dot(v0, v2);
-    float dot11 = d_dot(v1, v1);
-    float dot12 = d_dot(v1, v2);
-
-    // Calcular coordenadas baricêntricas
-    float invDenom = 1.0 / (dot00 * dot11 - dot01 * dot01);
-    float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
-    float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
-
-    // Verificar se as coordenadas baricêntricas estão dentro do intervalo [0, 1]
-    return (u >= 0) && (v >= 0) && (u + v <= 1);
-}
-
 // calculate the energy of the ray on the reflected panels along the way, returns 0 if none is hitted
-__device__ float calculateRayEnergy(struct plane* d_planes, struct ray ray, int current_reflection, int reflected_plane_index)
+__device__ float calculateRayEnergy(struct plane* d_planes, struct ray incident_ray, int current_reflection, int incident_plane_index, 
+                                    int planeAmount, int maxReflection, float absorptionRatio, float reflectionRatio)
 {
-    if (current_reflection > MAXRAYREFLECTION)
+    float total_energy = 0;
+
+    while(current_reflection < maxReflection)
     {
-        return 0;
-    }
+        int plane_index = -1;
 
-    float smallestDistanceSquared = INFINITY;
-    float distanceSquared;
+        vec3 edge1, edge2, crossProductResult, pointOfIntersection, edge1CrossProduct, reflection_point;
+        vec3 triangleVtx1, triangleVtx2, triangleVtx3, chosenEdge1, chosenEdge2;
 
-    int closest_plane_index = -1;
+        float determinantA, factorF, factorU, factorV, factorT, square_distance, chosen_factorT;
+        float smallest_distance = 1000000;
 
-    struct vec3 normal;
-    struct vec3 closestPlaneNormal;
-    struct vec3 triangle[3];
-
-    float intersectionDistance;
-    struct vec3 intersectionPoint;
-    struct vec3 closestIntersectionPoint;
-
-    struct vec3 distanceVector;
-
-    /*
-    printf("ray origin: (%.1f, %.1f, %.1f)\n", ray.origin.x, ray.origin.y, ray.origin.z);
-    printf("ray direction: (%.1f, %.1f, %.1f)\n", ray.direction.x, ray.direction.y, ray.direction.z);
-    */
-
-    for (int i = 0; i < PLANEAMOUNT; i++)
-    {
-        if (i == reflected_plane_index)
+        for (int i = 0; i < planeAmount; i++)
         {
-            continue; // Ignore if plane was the reflected before
-        }
-
-        for (int j = 0; j < 2; j++)
-        {
-            for (int k = 0; k < 3; k++)
+            if (i == incident_plane_index)
             {
-                triangle[k] = d_planeGet(d_planes[i], (k + i * 2) % 4);
+                continue;
+            }
+
+            for (int j = 0; j < 2; j++)
+            {
+                triangleVtx1 = d_planeGet(d_planes[i], (j * 2) % 4);
+                triangleVtx2 = d_planeGet(d_planes[i], (1 + j * 2) % 4);
+                triangleVtx3 = d_planeGet(d_planes[i], (2 + j * 2) % 4);
+
+                edge1 = d_vec3Minus(triangleVtx2, triangleVtx1);
+                edge2 = d_vec3Minus(triangleVtx3, triangleVtx1);
+
+                crossProductResult = d_cross(incident_ray.direction, edge2);
+                determinantA = d_dot(edge1, crossProductResult);
+
+                //Check if incident ray is parallel to plane
+                if (abs(determinantA) < .000001f)
+                {
+                    //printf("test 1\n");
+                    break;
+                }
+
+                factorF = 1.0 / determinantA;
+                pointOfIntersection = d_vec3Minus(incident_ray.origin, triangleVtx1);
+                factorU = factorF * d_dot(pointOfIntersection, crossProductResult);
+
+                //Check if ray-triangle intersection is in-bounds
+                if (factorU < 0 || factorU > 1)
+                {
+                    //printf("test 2\n");
+                    continue;
+                }
+
+                edge1CrossProduct = d_cross(pointOfIntersection, edge1);
+                factorV = factorF * d_dot(incident_ray.direction, edge1CrossProduct);
+
+                //Check if ray-triangle intersection is in-bounds
+                if (factorV < 0.0 || factorU + factorV > 1.0)
+                {
+                    //printf("test 3\n");
+                    continue;
+                }
+
+                factorT = factorF * d_dot(edge2, edge1CrossProduct);
+
+                //Check if ray-triangle intersection is not behind origin point
+                if (factorT < .000001f)
+                {
+                    //printf("test 4\n");
+                    continue;
+                }
+
+                reflection_point = d_vec3Plus(incident_ray.origin, d_vec3Multi(incident_ray.direction, factorT));
+                square_distance = d_squaredDistance(incident_ray.origin, reflection_point);
+
+                //Check if squared distance between origin and intersection point is the smallest found
+                if (square_distance >= smallest_distance)
+                {
+                    //printf("test 5\n");
+                    continue;
+                }
+
+                smallest_distance = square_distance;
+                incident_plane_index = i;
+                chosen_factorT = factorT;
+                chosenEdge1 = edge1;
+                chosenEdge2 = edge2;
+
+                //printf("test complete\n");
+                break;
             }
         }
 
-        normal = d_cross(vec3Minus(triangle[1], triangle[0]), vec3Minus(triangle[2], triangle[0]));
+        vec3 planeNormal = d_planes[incident_plane_index].normal;
 
-        // Cálculo do ponto de interseção entre o raio e o plano do triângulo
-        intersectionDistance = d_dot(vec3Minus(triangle[1], ray.origin), normal) / d_dot(ray.direction, normal);
-        intersectionPoint = vec3Plus(ray.origin, vec3Multi(ray.direction, intersectionDistance));
-
-        // Verificar se o ponto de interseção está dentro do triângulo
-        if (isPointInsideTriangle(intersectionPoint, triangle[0], triangle[1], triangle[2]))
+        // First veirfy if distance is not small enough, 
+        // then verify if ray is hitting plane from behind (cos is bigger than 0 (angle is bigger than 90))
+        if (smallest_distance >= 1000000 || d_dot(incident_ray.direction, planeNormal) >= 0)
         {
-            distanceVector = vec3Minus(ray.origin, intersectionPoint);
-            distanceVector = vec3Multi(distanceVector, distanceVector);
-            distanceSquared = distanceVector.x + distanceVector.y + distanceVector.z;
-
-            if (distanceSquared < smallestDistanceSquared) 
-            {
-                smallestDistanceSquared = distanceSquared;
-                closest_plane_index = i;
-
-                closestPlaneNormal = normal;
-                closestIntersectionPoint = intersectionPoint;
-            }
+            return total_energy;
         }
-    }
 
-    if (closest_plane_index != -1)
-    {
-        vec3 reflectedDirection = vec3Minus(closestIntersectionPoint, vec3Multi(closestPlaneNormal, 2.0 * d_dot(ray.direction, closestPlaneNormal)));
+        struct ray reflected_ray;
+        reflected_ray.origin = reflection_point;
 
-        struct ray reflectionRay;
-
-        reflectionRay.origin = closestIntersectionPoint;
-        reflectionRay.direction = reflectedDirection;
+        float dotProductResult = 2.0 * d_dot(incident_ray.direction, planeNormal);
+        reflected_ray.direction = d_vec3Minus(incident_ray.direction, d_vec3Multi(planeNormal, dotProductResult));
 
         // Calculating the absorved and the reflected energy
-        float reflected_energy = ray.energy * RAYREFLECTIONRATIO;
-        float absorved_energy = (ray.energy - reflected_energy) * RAYABSORPTIONRATIO;
-        reflectionRay.energy = reflected_energy;
+        float reflected_energy = incident_ray.energy * reflectionRatio;
+        float absorved_energy = (incident_ray.energy - reflected_energy) * absorptionRatio;
+        reflected_ray.energy = reflected_energy;
 
-        // Calling for the reflected ray
-        return absorved_energy + calculateRayEnergy(d_planes, reflectionRay, ++current_reflection, closest_plane_index);
+        total_energy += absorved_energy;
+
+        // Update variables for the next iteration
+        incident_ray = reflected_ray;
+        incident_plane_index = plane_index;
+        current_reflection++;
     }
 
-    return 0.0;
+    return total_energy;
 }
 
 #pragma endregion
 
 #pragma region GlobalFunctions
 
-__global__ void receiveRaysAndPlanes(struct ray* d_rays, struct plane* d_planes, float* d_total_energy)
+__global__ void receiveRaysAndPlanes(struct ray* d_rays, struct plane* d_planes, float* d_total_energy, int rayAmount, int planeAmount, int maxReflection, float absorptionRatio, float reflectionRatio)
 {
-    int ray_index = threadIdx.x + blockIdx.x * blockDim.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
 
-    if (ray_index >= X_RAYAMOUNT * Y_RAYAMOUNT)
+    for (int i = idx; i < rayAmount; i += stride)
     {
-        return;
+        float absorbed_energy = calculateRayEnergy(d_planes, d_rays[i], 0, -1, planeAmount, maxReflection, absorptionRatio, reflectionRatio);
+        atomicAdd(d_total_energy, absorbed_energy);
+
+        //printf("Ray %d -> Energy until now: %f\n", i, *d_total_energy);
     }
-
-    if (d_rays[ray_index].direction.x == 0.0 && d_rays[ray_index].direction.y == 0.0 && d_rays[ray_index].direction.z == 0.0)
-    {
-        return;
-    }
-
-    float absorved_energy = calculateRayEnergy(d_planes, d_rays[ray_index], 0, -1);
-    printf("%.2f\n", absorved_energy);
-
-    atomicAdd(d_total_energy, absorved_energy);
 }
 
 #pragma endregion
@@ -288,7 +320,7 @@ __global__ void receiveRaysAndPlanes(struct ray* d_rays, struct plane* d_planes,
 
 #pragma region GetFunctions
 
-__host__ float h_vec3Get(struct vec3 vec3_toget, int index)
+float h_vec3Get(struct vec3 vec3_toget, int index)
 {
     switch (index)
     {
@@ -305,7 +337,7 @@ __host__ float h_vec3Get(struct vec3 vec3_toget, int index)
     }
 }
 
-__host__ void h_vec3Set(struct vec3* vec3_toset, int index, float value)
+void h_vec3Set(struct vec3* vec3_toset, int index, float value)
 {
     switch (index)
     {
@@ -322,7 +354,7 @@ __host__ void h_vec3Set(struct vec3* vec3_toset, int index, float value)
     }
 }
 
-__host__ struct vec3 h_planeGet(struct plane plane_toget, int index)
+struct vec3 h_planeGet(struct plane plane_toget, int index)
 {
     switch (index)
     {
@@ -346,7 +378,7 @@ __host__ struct vec3 h_planeGet(struct plane plane_toget, int index)
 #pragma endregion
 
 // Função para normalizar um vetor vec3
-__host__ struct vec3 h_normalize(struct vec3 v) {
+struct vec3 h_normalize(struct vec3 v) {
     float len = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
 
     // Verificar se o comprimento é não nulo para evitar divisão por zero
@@ -359,14 +391,21 @@ __host__ struct vec3 h_normalize(struct vec3 v) {
     return v;
 }
 
-__host__ float rand_float(float min, float max)
+float rand_float(float min, float max)
 {
     float random = ((float)rand()) / (float)RAND_MAX;
     float range = max - min;
     return (random * range) + min;
 }
 
-__host__ void findPerpendicularVectors(vec3 direction, vec3* directionHeight, vec3* directionWidth)
+int rand_int(int min, int max)
+{
+    int random = rand();
+    int range = max - min;
+    return (random % range) + min;
+}
+
+void findPerpendicularVectors(vec3 direction, vec3* directionHeight, vec3* directionWidth)
 {
     // Escolher um vetor de referência que não seja colinear com a normal
     vec3 referenceVector;
@@ -393,19 +432,13 @@ __host__ void findPerpendicularVectors(vec3 direction, vec3* directionHeight, ve
     directionWidth->z = direction.x * directionHeight->y - direction.y * directionHeight->x;
 }
 
-__host__ void CreateSetsOfRays(struct ray* ray_array, struct vec3 direction, struct vec3 origin, int collums, int rows, float distance, float total_energy)
+void CreateSetsOfRays(struct ray* ray_array, struct vec3 direction, struct vec3 origin, int collums, int rows, float distance, float total_energy)
 {
     struct vec3 directionY;
     struct vec3 directionX;
 
     direction = h_normalize(direction);
     findPerpendicularVectors(direction, &directionY, &directionX);
-
-    /*
-    printf("RayDirection -> x: %.2f | y: %.2f | z: %.2f\n", direction->x, direction->y, direction->z);
-    printf("RayY -> x: %.2f | y: %.2f | z: %.2f\n", directionY.x, directionY.y, directionY.z);
-    printf("RayX -> x: %.2f | y: %.2f | z: %.2f\n\n", directionX.x, directionX.y, directionX.z);
-    */
 
     float half_height = distance / 2;
     float half_width = distance / 2;
@@ -415,16 +448,19 @@ __host__ void CreateSetsOfRays(struct ray* ray_array, struct vec3 direction, str
 
     for (int i = 0; i < rows; i++)
     {
-        current_point = origin + (directionY * half_height * (rows - 1 - (i * 2)) + directionX * half_width * (collums - 1) * -1);
+        current_point.x = origin.x + (directionY.x * half_height * (rows - 1 - (i * 2)) + directionX.x * half_width * (collums - 1) * -1);
+        current_point.y = origin.y + (directionY.y * half_height * (rows - 1 - (i * 2)) + directionX.y * half_width * (collums - 1) * -1);
+        current_point.z = origin.z + (directionY.z * half_height * (rows - 1 - (i * 2)) + directionX.z * half_width * (collums - 1) * -1);
 
         for (int j = 0; j < collums; j++)
         {
-            //printf("\ncur point -> x: %.2f | y: %.2f | z: %.2f\n", current_point.x, current_point.y, current_point.z);
-
             ray_array[total_rays].origin = current_point;
             ray_array[total_rays].direction = direction;
 
-            current_point = current_point + directionX * distance;
+            current_point.x += directionX.x * distance;
+            current_point.y += directionX.y * distance;
+            current_point.z += directionX.z * distance;
+
             total_rays++;
         }
     }
@@ -437,10 +473,113 @@ __host__ void CreateSetsOfRays(struct ray* ray_array, struct vec3 direction, str
     }
 }
 
+void CalculateVectorByAngle(float angle, vec3* vector)
+{
+    // Converte o ângulo de graus para radianos
+    float radianAngle = angle * (M_PI / 180.0);
+
+    // Calcula as componentes do vetor
+    vector->x = cos(radianAngle);
+    vector->y = 0;
+    vector->z = sin(radianAngle);
+}
+
+struct vec3 GetRaySphereIntersection(float sphereRadius, struct vec3 rayDirection)
+{
+    struct vec3 result;
+
+    // Coeficientes da equação quadrática
+    float a = pow(rayDirection.x, 2) + pow(rayDirection.y, 2) + pow(rayDirection.z, 2);
+    float c = -pow(sphereRadius, 2);
+
+    // Discriminante da equação quadrática
+    float discriminant = -4 * a * c;
+
+    // Calcula os pontos de interseção
+    float t1 = sqrt(discriminant) / (2 * a);
+
+    // Calcula as coordenadas do ponto de interseção
+    result.x = t1 * rayDirection.x;
+    result.y = t1 * rayDirection.y;
+    result.z = t1 * rayDirection.z;
+
+    return result;
+}
+
+void FindArcPoints(double radius, vec3 points[])
+{
+    int pTotal = ARC_POINTS + 1;
+    double angulo = 0.0;
+    double anguloIncremento = M_PI / pTotal;
+
+    for (int i = 0; i < pTotal - 1; i++)
+    {
+        angulo += anguloIncremento;
+        points[i].x = radius;
+        points[i].y = radius * sin(angulo) + ARC_HEIGHT;
+        points[i].z = radius * cos(angulo);
+    }
+}
+
+void CreateSetsOfRayPlanes(struct ray* ray_array)
+{
+    vec3 rayDirection;
+
+    CalculateVectorByAngle(ARC_ANGLE, &rayDirection);
+    vec3 intersectionPoint = GetRaySphereIntersection(ARC_DISTANCE, rayDirection);
+
+    float radius = intersectionPoint.x;
+    float half_distance = RAY_INTER_DISTANCE / 2;
+
+    vec3 arcPoints[ARC_POINTS];
+    FindArcPoints(radius, arcPoints);
+
+    vec3 directionY;
+    vec3 directionX;
+    vec3 pointDirection;
+    vec3 current_point;
+
+    int total_rays;
+    float energy_per_ray;
+
+    for (int i = 0; i < ARC_POINTS; i++)
+    {
+        pointDirection = h_normalize({ -arcPoints[i].x, -arcPoints[i].y + ARC_HEIGHT, -arcPoints[i].z });
+        findPerpendicularVectors(pointDirection, &directionY, &directionX);
+
+        total_rays = 0;
+
+        for (int j = 0; j < Y_RAY_AMOUNT; j++)
+        {
+            current_point.x = arcPoints[i].x + (directionY.x * half_distance * (Y_RAY_AMOUNT - 1 - (floor(total_rays / X_RAY_AMOUNT) * 2)) + directionX.x * half_distance * (X_RAY_AMOUNT - 1) * -1);
+            current_point.y = arcPoints[i].y + (directionY.y * half_distance * (Y_RAY_AMOUNT - 1 - (floor(total_rays / X_RAY_AMOUNT) * 2)) + directionX.y * half_distance * (X_RAY_AMOUNT - 1) * -1);
+            current_point.z = arcPoints[i].z + (directionY.z * half_distance * (Y_RAY_AMOUNT - 1 - (floor(total_rays / X_RAY_AMOUNT) * 2)) + directionX.z * half_distance * (X_RAY_AMOUNT - 1) * -1);
+
+            for (int k = 0; k < X_RAY_AMOUNT; k++)
+            {
+                ray_array[i * ARC_POINTS + total_rays].origin = current_point;
+                ray_array[i * ARC_POINTS + total_rays].direction = pointDirection;
+
+                current_point.x += directionX.x * RAY_INTER_DISTANCE;
+                current_point.y += directionX.y * RAY_INTER_DISTANCE;
+                current_point.z += directionX.z * RAY_INTER_DISTANCE;
+
+                total_rays++;
+            }
+        }
+
+        energy_per_ray = RAY_GROUP_ENERGY / total_rays;
+
+        for (int j = 0; j < total_rays; j++)
+        {
+            ray_array[i * ARC_POINTS + j].energy = energy_per_ray;
+        }
+    }
+}
+
 #pragma region host vector triangle intersection functions
 
-// Função para calcular o produto vetorial entre dois vetores
-__host__ vec3 h_cross(struct vec3 a, struct vec3 b)
+vec3 h_cross(struct vec3 a, struct vec3 b)
 {
     vec3 result;
 
@@ -451,44 +590,55 @@ __host__ vec3 h_cross(struct vec3 a, struct vec3 b)
     return result;
 }
 
-// Função para calcular o produto escalar (dot product) entre dois vetores
-__host__ float h_dot(struct vec3 a, struct vec3 b)
+float h_dot(struct vec3 a, struct vec3 b)
 {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// Função para verificar interseção entre vetor e triângulo
-__host__ bool checkIntersectionVectorTriangle(struct vec3 v1, struct vec3 v2, struct vec3 t1, struct vec3 t2, struct vec3 t3, struct vec3 normal )
+// Check for line-triangle intersection
+bool checkIntersectionLineTriangle(struct vec3 lineStart, struct vec3 lineEnd, struct vec3 triangleVtx1, struct vec3 triangleVtx2, struct vec3 triangleVtx3)
 {
-    // Calcula a direção do vetor
-    vec3 direction = v2 - v1;
+    struct vec3 triangleEdge1, triangleEdge2, lineDirection, lineToStart, intersectionPoint, lineToTriangleEdge1CrossProduct;
+    float determinantA, factorF, factorU, factorV, factorT;
 
-    // Calcula o ponto de interseção entre o vetor e o plano do triângulo
-    float planeConstant = -normal.x * t1.x - normal.y * t1.y - normal.z * t1.z;
-    float intersectionParameter = -(normal.x * v1.x + normal.y * v1.y + normal.z * v1.z + planeConstant) / (normal.x * direction.x + normal.y * direction.y + normal.z * direction.z);
+    triangleEdge1 = triangleVtx2 - triangleVtx1;
+    triangleEdge2 = triangleVtx3 - triangleVtx1;
+    lineDirection = lineEnd - lineStart;
 
-    // Verifica se o ponto de interseção está dentro dos limites do triângulo
-    if (intersectionParameter >= 0 && intersectionParameter <= 1)
+    determinantA = h_dot(triangleEdge1, h_cross(lineDirection, triangleEdge2));
+
+    //Check if line is parallel to plane
+    if (abs(determinantA) < .000001f)
     {
-        vec3 intersectionPoint = v1 + direction * intersectionParameter;
+        return false;
+    }
 
-        // Verifique se o ponto de interseção está dentro do triângulo usando coordenadas barycentricas
-        vec3 edge1 = t2 - t1;
-        vec3 edge2 = t3 - t1;
+    factorF = 1 / determinantA;
+    lineToStart = lineStart = triangleVtx1;
 
-        vec3 crossVec = h_cross(direction, edge2);
-        float a = h_dot(edge1, crossVec);
+    factorU = factorF * h_dot(lineToStart, h_cross(lineDirection, triangleEdge2));
 
-        if (a != 0)
-        {
-            float u = h_dot(edge1, h_cross(v1 - t1, crossVec)) / a;
-            float v = h_dot(direction, h_cross(v1 - t1, crossVec)) / a;
+    //Check if line-triangle intersection is in-bounds
+    if (factorU < 0.0 || factorU > 1.0)
+    {
+        return false;
+    }
 
-            if (u >= 0 && v >= 0 && u + v <= 1)
-            {
-                return true;
-            }
-        }
+    lineToTriangleEdge1CrossProduct = h_cross(lineToStart, triangleEdge1);
+    factorV = factorF * h_dot(lineDirection, lineToTriangleEdge1CrossProduct);
+
+    //Check if line-triangle intersection is in-bounds
+    if (factorV < 0.0 || factorU + factorV > 1.0)
+    {
+        return false;
+    }
+
+    factorT = factorF * h_dot(triangleEdge2, lineToTriangleEdge1CrossProduct);
+
+    //Check if line-triangle intersection is not behind origin point
+    if (factorT > .000001f && factorT < 1.0)
+    {
+        return true;
     }
 
     return false;
@@ -498,14 +648,9 @@ __host__ bool checkIntersectionVectorTriangle(struct vec3 v1, struct vec3 v2, st
 
 #pragma region planeCreation
 
-//Divide o primeiro plano em vetores e o segundo plano em triângulos, verificando-os individualmente
-__host__ bool checkIfPlanesCollide(struct plane plane1, struct plane plane2)
+//Divide the first plane into vectors and the second into triangles, checking for intersections
+bool checkIfPlanesCollide(struct plane plane1, struct plane plane2)
 {
-    if (plane1.center == plane2.center)
-    {
-        return true;
-    }
-
     struct vec3 v1;
     struct vec3 v2;
 
@@ -514,12 +659,12 @@ __host__ bool checkIfPlanesCollide(struct plane plane1, struct plane plane2)
     struct vec3 t3 = h_planeGet(plane2, 2);
     struct vec3 t4 = h_planeGet(plane2, 3);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 4; i++)
     {
         v1 = h_planeGet(plane1, i);
-        v2 = h_planeGet(plane1, i + 1);
+        v2 = h_planeGet(plane1, (i + 1) % 4);
 
-        if (checkIntersectionVectorTriangle(v1, v2, t1, t2, t3, plane2.normal) || checkIntersectionVectorTriangle(v1, v2, t3, t4, t1, plane2.normal))
+        if (checkIntersectionLineTriangle(v1, v2, t1, t2, t3) || checkIntersectionLineTriangle(v1, v2, t3, t4, t1))
         {
             return true;
         }
@@ -528,7 +673,7 @@ __host__ bool checkIfPlanesCollide(struct plane plane1, struct plane plane2)
     return false; // Não há interseção
 }
 
-__host__ bool checkIfPlaneIsInBounds(struct plane plane_to_check, struct vec3 positive_limit, struct vec3 negative_limit)
+bool checkIfPlaneIsInBounds(struct plane plane_to_check, struct vec3 positive_limit, struct vec3 negative_limit)
 {
     float negative_bound;
     float positive_bound;
@@ -554,10 +699,15 @@ __host__ bool checkIfPlaneIsInBounds(struct plane plane_to_check, struct vec3 po
     return true;
 }
 
-__host__ bool checkIfPlaneIsValid(struct plane plane_to_check, struct plane* plane_array, int plane_amount, struct vec3 positive_limit, struct vec3 negative_limit)
+bool checkIfPlaneIsValid(struct plane plane_to_check, struct plane* plane_array, int idx_to_ignore, int plane_amount, struct vec3 positive_limit, struct vec3 negative_limit)
 {
     for (int i = 0; i < plane_amount; i++)
     {
+        if (idx_to_ignore == i)
+        {
+            continue;
+        }
+
         if (checkIfPlanesCollide(plane_array[i], plane_to_check) || !checkIfPlaneIsInBounds(plane_to_check, positive_limit, negative_limit))
         {
             return false;
@@ -567,74 +717,55 @@ __host__ bool checkIfPlaneIsValid(struct plane plane_to_check, struct plane* pla
     return true;
 }
 
-__host__ struct plane CreatePlane(struct vec3 origin, struct vec3 direction, float plane_width, float plane_height)
-{
-    struct vec3 directionY;
-    struct vec3 directionX;
-
-    findPerpendicularVectors(direction, &directionY, &directionX);
-
-    struct plane new_plane;
-
-    new_plane.pa = origin + (directionY * (plane_height / 2)) + (directionX * (plane_width / 2));
-    new_plane.pb = origin + (directionY * (plane_height / 2)) - (directionX * (plane_width / 2));
-    new_plane.pc = origin - (directionY * (plane_height / 2)) - (directionX * (plane_width / 2));
-    new_plane.pd = origin - (directionY * (plane_height / 2)) + (directionX * (plane_width / 2));
-
-    new_plane.center = origin;
-    new_plane.normal = direction;
-
-    return new_plane;
-}
-
-// ---------------------------
-// ----------- old -----------
-// ---------------------------
-__host__ void CreatePlaneOld(struct plane* plane_array, int plane_inx, struct vec3 origin, struct vec3 direction, float plane_width, float plane_height)
+struct plane CreatePlane(struct vec3 origin, struct vec3 direction, float plane_width, float plane_height)
 {
     struct vec3 directionY;
     struct vec3 directionX;
 
     direction = h_normalize(direction);
-
     findPerpendicularVectors(direction, &directionY, &directionX);
-
-    printf("\nPlane: orientation -> x: %.1f | y: %.1f | z: %.1f\n", direction.x, direction.y, direction.z);
-    printf("\nPlane: direction y -> x: %.1f | y: %.1f | z: %.1f\n", directionY.x, directionY.y, directionY.z);
-    printf("\nPlane: direction x -> x: %.1f | y: %.1f | z: %.1f\n", directionX.x, directionX.y, directionX.z);
 
     struct plane new_plane;
 
-    new_plane.pa = origin + (directionY * (plane_height / 2)) + (directionX * (plane_width / 2));
-    new_plane.pb = origin + (directionY * (plane_height / 2)) - (directionX * (plane_width / 2));
-    new_plane.pc = origin - (directionY * (plane_height / 2)) - (directionX * (plane_width / 2));
-    new_plane.pd = origin - (directionY * (plane_height / 2)) + (directionX * (plane_width / 2));
+    new_plane.pa.x = origin.x + (directionY.x * plane_height / 2) + (directionX.x * plane_width / 2);
+    new_plane.pa.y = origin.y + (directionY.y * plane_height / 2) + (directionX.y * plane_width / 2);
+    new_plane.pa.z = origin.z + (directionY.z * plane_height / 2) + (directionX.z * plane_width / 2);
 
-    new_plane.center = origin;
-    new_plane.normal = direction;
+    new_plane.pb.x = origin.x + (directionY.x * plane_height / 2) - (directionX.x * plane_width / 2);
+    new_plane.pb.y = origin.y + (directionY.y * plane_height / 2) - (directionX.y * plane_width / 2);
+    new_plane.pb.z = origin.z + (directionY.z * plane_height / 2) - (directionX.z * plane_width / 2);
 
-    plane_array[plane_inx] = new_plane;
+    new_plane.pc.x = origin.x - (directionY.x * plane_height / 2) - (directionX.x * plane_width / 2);
+    new_plane.pc.y = origin.y - (directionY.y * plane_height / 2) - (directionX.y * plane_width / 2);
+    new_plane.pc.z = origin.z - (directionY.z * plane_height / 2) - (directionX.z * plane_width / 2);
+
+    new_plane.pd.x = origin.x - (directionY.x * plane_height / 2) + (directionX.x * plane_width / 2);
+    new_plane.pd.y = origin.y - (directionY.y * plane_height / 2) + (directionX.y * plane_width / 2);
+    new_plane.pd.z = origin.z - (directionY.z * plane_height / 2) + (directionX.z * plane_width / 2);
+
+    return new_plane;
 }
 
-__host__ void CreateSetsOfPlanes(struct plane* plane_array, int plane_amount, struct vec3 positive_limit, struct vec3 negative_limit, float plane_width, float plane_height)
+void CreateSetsOfPlanes(struct plane* plane_array, int plane_amount, struct vec3 positive_limit, struct vec3 negative_limit, float plane_width, float plane_height)
 {
     struct vec3 direction;
     struct vec3 point;
 
     int rejection_limit = 100;
+    float board_thickness = (plane_width + plane_height) / 2;
 
     for (int i = 0; i < plane_amount; i++)
     {
         direction = h_normalize(vec3{ rand_float(0, 1), rand_float(0, 1), rand_float(0, 1) });
-        point = { rand_float(negative_limit.x, positive_limit.x), rand_float(negative_limit.y, positive_limit.y), rand_float(negative_limit.z, positive_limit.z) };
+        float soft_clamp_x = rand_float(negative_limit.x + board_thickness, positive_limit.x - board_thickness);
+        float soft_clamp_y = rand_float(negative_limit.y + board_thickness, positive_limit.y - board_thickness);
+        float soft_clamp_z = rand_float(negative_limit.z + board_thickness, positive_limit.z - board_thickness);
+
+        point = { soft_clamp_x ,soft_clamp_y ,soft_clamp_z };
 
         struct plane new_plane = CreatePlane(point, direction, plane_width, plane_height);
-        new_plane.normal = direction;
-        new_plane.center = point;
 
-        printf("\ndirection -> x: %.2f | y: %.2f | z: %.2f\n", i, direction.x, direction.y, direction.z);
-
-        if (!checkIfPlaneIsValid(new_plane, plane_array, i, positive_limit, negative_limit))
+        if (!checkIfPlaneIsValid(new_plane, plane_array, -1, i, positive_limit, negative_limit))
         {
             rejection_limit--;
 
@@ -647,74 +778,140 @@ __host__ void CreateSetsOfPlanes(struct plane* plane_array, int plane_amount, st
             continue;
         }
 
+        new_plane.normal = direction;
         plane_array[i] = new_plane;
     }
 }
 
 #pragma endregion
 
-__host__ int ceil(int total, int threads)
+void PerturbCurrentPlanesLayout(struct plane* plane_array, int plane_amount, struct vec3 positive_limit, struct vec3 negative_limit, float plane_width, float plane_height)
 {
-    return (total - 1) / threads + 1;
+    struct vec3 direction;
+    struct vec3 center_poimt;
+
+    int rejection_limit = 100;
+    int rand_idx;
+
+    for (int i = 0; i < rejection_limit; i++)
+    {
+        rand_idx = rand_int(0, plane_amount);
+
+        direction = h_normalize(vec3{ rand_float(0, 1), rand_float(0, 1), rand_float(0, 1) });
+        center_poimt = { rand_float(negative_limit.x, positive_limit.x), rand_float(negative_limit.y, positive_limit.y), rand_float(negative_limit.z, positive_limit.z) };
+
+        struct plane new_plane = CreatePlane(center_poimt, direction, plane_width, plane_height);
+
+        if (checkIfPlaneIsValid(new_plane, plane_array, rand_idx, plane_amount, positive_limit, negative_limit))
+        {
+            plane_array[rand_idx] = new_plane;
+            break;
+        }
+    }
+}
+
+// Alloc GPU memory space and transferer the data 
+void copyDataToGPU(struct ray h_rays[ARC_POINTS * X_RAY_AMOUNT * Y_RAY_AMOUNT], struct plane h_planes[PLANE_AMOUNT], struct ray** d_rays, struct plane** d_planes)
+{
+    cudaMalloc(d_rays, ARC_POINTS * X_RAY_AMOUNT * Y_RAY_AMOUNT * sizeof(struct ray));
+    cudaMalloc(d_planes, PLANE_AMOUNT * sizeof(struct plane));
+
+    cudaMemcpy(*d_rays, h_rays, ARC_POINTS * X_RAY_AMOUNT * Y_RAY_AMOUNT * sizeof(struct ray), cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_planes, h_planes, PLANE_AMOUNT * sizeof(struct plane), cudaMemcpyHostToDevice);
 }
 
 #pragma endregion
 
 int main()
 {
-    srand(static_cast<unsigned int>(time(nullptr)));
+    clock_t start_time = clock();
 
-    struct plane planes[PLANEAMOUNT];
+    srand(time(NULL));
+    int rayGroupSize = X_RAY_AMOUNT * Y_RAY_AMOUNT;
+
+    int deviceId;
+    int numberOfSMs;
+
+    cudaGetDevice(&deviceId);
+    cudaDeviceGetAttribute(&numberOfSMs, cudaDevAttrMultiProcessorCount, deviceId);
+
+    struct plane h_planes[PLANE_AMOUNT];
     struct plane* d_planes;
-    int planes_size = sizeof(struct plane) * PLANEAMOUNT;
+    int planes_size = sizeof(struct plane) * PLANE_AMOUNT;
 
-    struct ray rays[X_RAYAMOUNT * Y_RAYAMOUNT];
+    struct ray h_rays[ARC_POINTS * X_RAY_AMOUNT * Y_RAY_AMOUNT];
     struct ray* d_rays;
-    int rays_size = sizeof(struct ray) * X_RAYAMOUNT * Y_RAYAMOUNT;
+    int rays_size = sizeof(struct ray) * ARC_POINTS * rayGroupSize;
 
-    float total_energy = 0.0;
-    float* d_total_energy;
+    float current_energy;
+    float* d_simulation_energy;
 
-    CreateSetsOfRays(rays, { 0,0,1 }, { 0,0,0 }, X_RAYAMOUNT, Y_RAYAMOUNT, 1.0, 1.0);
+    CreateSetsOfRayPlanes(h_rays);
+    CreateSetsOfPlanes(h_planes, PLANE_AMOUNT, PLANE_MAX_BOUNDS, PLANE_MIN_BOUNDS, PLANE_WIDTH, PLANE_HEIGHT);
 
-    //CreatePlaneOld(planes, 0, vec3{ 0,0,1 }, vec3{ 0,0,-1 }, 2, 2);
-    CreatePlaneOld(planes, 0, vec3{ 0,0,1 }, vec3{ 0,0,-1 }, 2, 2);
+    copyDataToGPU(h_rays, h_planes, &d_rays, &d_planes);
+    cudaMalloc((void**)&d_simulation_energy, sizeof(float));
 
-    //printf("\n\nCollision? -> %d\n\n", checkIfPlanesCollide(planes[0], planes[1]));
+    struct plane best_planes[PLANE_AMOUNT];
+    float best_energy = 0;
+    float energyDelta;
 
-    printf("pa -> x:%.1f | y:%.1f | z:%.1f\n", planes[0].pa.x, planes[0].pa.y, planes[0].pa.z);
-    printf("\npb -> x:%.1f | y:%.1f | z:%.1f\n", planes[0].pb.x, planes[0].pb.y, planes[0].pb.z);
-    printf("\npc -> x:%.1f | y:%.1f | z:%.1f\n", planes[0].pc.x, planes[0].pc.y, planes[0].pc.z);
-    printf("\npd -> x:%.1f | y:%.1f | z:%.1f\n", planes[0].pd.x, planes[0].pd.y, planes[0].pd.z);
+    float temperature = 1000;
+    float coolingRate = .95;
 
+    // Configuração do número de blocos e threads por bloco
+    dim3 threadsPerBlock(256);
+    dim3 blocksPerGrid((rayGroupSize + threadsPerBlock.x - 1) * numberOfSMs / 256);
 
-    for (int i = 0; i < X_RAYAMOUNT * Y_RAYAMOUNT; i++)
+    for (int j = 0; j < PLANE_AMOUNT; j++)
     {
-        printf("\nRayOrigin[%d] -> x: %.2f | y: %.2f | z: %.2f\n", i, rays[i].origin.x, rays[i].origin.y, rays[i].origin.z);
-        printf("RayDirection[%d] -> x: %.2f | y: %.2f | z: %.2f\n", i, rays[i].direction.x, rays[i].direction.y, rays[i].direction.z);
-        printf("RayEnergy[%d] -> %.2f\n", i, rays[i].energy);
+        best_planes[j] = h_planes[j];
     }
 
-    cudaMalloc((void**)&d_planes, planes_size);
-    cudaMemcpy(d_planes, &planes, planes_size, cudaMemcpyHostToDevice);
+    for (int i = 0; i < MAXGENERATIONLOOP; i++)
+    {
+        current_energy = 0;
+        cudaMemcpy(d_simulation_energy, &current_energy, sizeof(float), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
 
-    cudaMalloc((void**)&d_rays, rays_size);
-    cudaMemcpy(d_rays, &rays, rays_size, cudaMemcpyHostToDevice);
+        receiveRaysAndPlanes << <blocksPerGrid, threadsPerBlock >> > (d_rays, d_planes, d_simulation_energy, rayGroupSize * ARC_POINTS,
+            PLANE_AMOUNT, MAX_RAY_REFLECTION, RAY_ABSORPTION_RATIO, RAY_REFLECTION_RATIO);
 
-    cudaMalloc((void**)&d_total_energy, sizeof(float));
-    cudaMemcpy(d_total_energy, &total_energy, sizeof(float), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&current_energy, d_simulation_energy, sizeof(float), cudaMemcpyDeviceToHost);
 
-    int blocks_amount = ceil(X_RAYAMOUNT * Y_RAYAMOUNT, THREADSPERBLOCK);
+        printf("Current Generation: %d -> U Energy: %f -> A Energy: %f - ", i, current_energy, current_energy / ARC_POINTS);
+        if (current_energy > best_energy)
+        {
+            printf("Optimized! -> old: %f , new: %f\n", best_energy, current_energy);
+            best_energy = current_energy;
 
-    receiveRaysAndPlanes <<<blocks_amount, THREADSPERBLOCK >>> (d_rays, d_planes, d_total_energy);
-    cudaDeviceSynchronize();
+            for (int j = 0; j < PLANE_AMOUNT; j++)
+            {
+                best_planes[j] = h_planes[j];
+            }
+        }
+        else
+        {
+            printf("Not optimized\n");
+            for (int j = 0; j < PLANE_AMOUNT; j++)
+            {
+                h_planes[j] = best_planes[j];
+            }
+        }
 
-    cudaMemcpy(&total_energy, d_total_energy, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_planes);
+        PerturbCurrentPlanesLayout(h_planes, PLANE_AMOUNT, PLANE_MAX_BOUNDS, PLANE_MIN_BOUNDS, PLANE_WIDTH, PLANE_HEIGHT);
+        cudaMemcpy(d_planes, h_planes, PLANE_AMOUNT * sizeof(struct plane), cudaMemcpyHostToDevice);
+    }
+
     cudaFree(d_rays);
-    cudaFree(d_total_energy);
+    cudaFree(d_planes);
+    cudaFree(d_simulation_energy);
 
-    printf("total energy absorved: %f", total_energy);
+    printf("\ntotal energy: %f\n", best_energy);
 
+    clock_t end_time = clock();
+    double cpu_time_used = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("Tempo de execucao: %f segundos\n", cpu_time_used);
     return 0;
 }
